@@ -1,0 +1,11 @@
+# Vagrant
+.vagrant/
+*.log
+diag.log
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/
+# архивы и временные файлы
+*.tar.gz
+*.zip

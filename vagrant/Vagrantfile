@@ -1,0 +1,157 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# DevOps продвинутый курс: Kubernetes и CI/CD на основе GitLab
+# Учебный стенд: mgmt + master-1 + worker-1 + worker-2 (+ gitlab-runner по запросу)
+#
+# Поддерживаемые провайдеры:
+#   virtualbox — Windows, Linux, macOS Intel, macOS Apple Silicon (VirtualBox 7.2+)
+#   libvirt    — Linux (плагин vagrant-libvirt)
+#   qemu       — macOS Apple Silicon (плагин vagrant-qemu + socket_vmnet), если VirtualBox не подходит
+#
+# ВАЖНО: провайдер указывается ЯВНО, одним из способов:
+#   1) переменная окружения VAGRANT_DEFAULT_PROVIDER=virtualbox|libvirt|qemu
+#   2) ключ vagrant up --provider=virtualbox|libvirt|qemu
+#
+# Все параметры можно переопределить переменными окружения LAB_* (см. ниже и README.md).
+
+Vagrant.require_version ">= 2.4.0"
+
+# ---------------------------------------------------------------------------
+# Определяем провайдер (нужно заранее — от него зависят box и подсеть)
+# ---------------------------------------------------------------------------
+def detect_provider
+  ARGV.each_with_index do |arg, i|
+    return arg.split("=", 2)[1] if arg.start_with?("--provider=")
+    return ARGV[i + 1] if arg == "--provider" && ARGV[i + 1]
+  end
+  return ENV["VAGRANT_DEFAULT_PROVIDER"] if ENV["VAGRANT_DEFAULT_PROVIDER"]
+
+  # Машины уже созданы — берём провайдер из каталога .vagrant
+  created = Dir.glob(File.join(__dir__, ".vagrant", "machines", "*", "*", "id"))
+  return created.first.split(File::SEPARATOR)[-2] unless created.empty?
+
+  # Провайдер не указан: угадываем так же, как Vagrant — по тому, что установлено.
+  # (Иначе Vagrant может сам выбрать qemu/libvirt, а box и подсеть останутся от VirtualBox.)
+  return "virtualbox" if command_exists?("VBoxManage")
+  return "libvirt" if RUBY_PLATFORM.include?("linux") && Vagrant.has_plugin?("vagrant-libvirt")
+  return "qemu" if Vagrant.has_plugin?("vagrant-qemu")
+
+  "virtualbox"
+end
+
+def command_exists?(cmd)
+  exts = ENV["PATHEXT"] ? ENV["PATHEXT"].split(";") : [""]
+  ENV["PATH"].to_s.split(File::PATH_SEPARATOR).any? do |dir|
+    exts.any? { |ext| File.executable?(File.join(dir, "#{cmd}#{ext}")) }
+  end
+end
+
+PROVIDER = detect_provider
+
+# ---------------------------------------------------------------------------
+# Параметры стенда
+# ---------------------------------------------------------------------------
+# Подсеть одна для всех провайдеров — 192.168.56.0/24 (как во всех материалах курса).
+# Для qemu демон socket_vmnet запускается с шлюзом 192.168.56.1 (см. README.md).
+NET = ENV.fetch("LAB_NET", "192.168.56")
+
+# Box с Ubuntu 24.04. bento/ubuntu-24.04 публикуется для virtualbox (amd64/arm64) и libvirt.
+DEFAULT_BOX = {
+  "virtualbox" => "bento/ubuntu-24.04",
+  "libvirt"    => "bento/ubuntu-24.04",
+  "qemu"       => "crystax/ubuntu2404"       # libvirt-формат, arm64; проверен с vagrant-qemu на Apple Silicon
+}
+BOX = ENV.fetch("LAB_BOX", DEFAULT_BOX.fetch(PROVIDER, "bento/ubuntu-24.04"))
+
+# Для qemu на macOS нужен демон socket_vmnet (сеть между ВМ и с хостом)
+SOCKET_VMNET = ENV.fetch("LAB_SOCKET_VMNET", "/opt/homebrew/var/run/socket_vmnet")
+
+if %w[up status provision reload].include?(ARGV[0])
+  $stderr.puts "==> devops-lab: провайдер #{PROVIDER}, подсеть #{NET}.0/24, box #{BOX}"
+  if PROVIDER == "qemu" && RUBY_PLATFORM.include?("darwin") && !File.exist?(SOCKET_VMNET)
+    $stderr.puts "==> devops-lab: ВНИМАНИЕ: не найден #{SOCKET_VMNET} — запустите socket_vmnet (см. README.md, раздел qemu)"
+  end
+end
+
+MGMT_MEM   = ENV.fetch("LAB_MGMT_MEM",   "1536").to_i
+MASTER_MEM = ENV.fetch("LAB_MASTER_MEM", "2560").to_i
+WORKER_MEM = ENV.fetch("LAB_WORKER_MEM", "4096").to_i
+RUNNER_MEM = ENV.fetch("LAB_RUNNER_MEM", "1536").to_i
+
+NODES = [
+  { name: "mgmt",          ip: "#{NET}.10", serial: 33310, cpus: 1, mem: MGMT_MEM,   autostart: true,  role: "mgmt" },
+  { name: "master-1",      ip: "#{NET}.11", serial: 33311, cpus: 2, mem: MASTER_MEM, autostart: true,  role: "k8s" },
+  { name: "worker-1",      ip: "#{NET}.21", serial: 33321, cpus: 2, mem: WORKER_MEM, autostart: true,  role: "k8s" },
+  { name: "worker-2",      ip: "#{NET}.22", serial: 33322, cpus: 2, mem: WORKER_MEM, autostart: true,  role: "k8s" },
+  # Отдельная ВМ для GitLab Runner. Не стартует по умолчанию: vagrant up gitlab-runner
+  { name: "gitlab-runner", ip: "#{NET}.31", serial: 33331, cpus: 2, mem: RUNNER_MEM, autostart: false, role: "runner" }
+]
+
+HOSTS_ARG = NODES.map { |n| "#{n[:ip]}:#{n[:name]}" }.join(",")
+
+Vagrant.configure("2") do |config|
+  config.vm.box = BOX
+  config.vm.box_check_update = false
+
+  # Общая папка не нужна: всё ставится скриптами. Отключаем, чтобы не было
+  # запросов пароля SMB/NFS (macOS + qemu, Windows) и проблем с guest additions.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  config.ssh.insert_key = true
+
+  # Первая загрузка облачного образа (cloud-init, расширение диска) на qemu
+  # бывает долгой, особенно когда стартуют несколько ВМ сразу
+  config.vm.boot_timeout = 600
+
+  NODES.each do |node|
+    config.vm.define node[:name], autostart: node[:autostart], primary: node[:name] == "mgmt" do |vm|
+      vm.vm.hostname = node[:name]
+      vm.vm.network "private_network", ip: node[:ip]
+
+      # ---------------- VirtualBox ----------------
+      vm.vm.provider "virtualbox" do |vb|
+        vb.name   = "devops-#{node[:name]}"
+        vb.cpus   = node[:cpus]
+        vb.memory = node[:mem]
+        vb.linked_clone = true
+      end
+
+      # ---------------- libvirt (Linux) ----------------
+      vm.vm.provider "libvirt" do |lv|
+        lv.cpus   = node[:cpus]
+        lv.memory = node[:mem]
+        lv.cpu_mode = "host-passthrough"
+        lv.default_prefix = "devops_"
+      end
+
+      # ---------------- qemu (macOS Apple Silicon) ----------------
+      vm.vm.provider "qemu" do |qe|
+        qe.memory = "#{node[:mem]}M"
+        qe.smp    = node[:cpus]
+        # PCI-сетевые карты нумеруются по порядку: eth0 = NAT (SSH Vagrant), eth1 = сеть стенда.
+        # С virtio-net-device (MMIO, по умолчанию) ядро видит их в обратном порядке —
+        # DHCP уходит не на тот интерфейс, и Vagrant не может зайти по SSH.
+        qe.net_device = "virtio-net-pci"
+        qe.advanced_network = true
+        qe.net_mode = :socket_vmnet
+        qe.socket_vmnet_socket = SOCKET_VMNET
+        qe.ssh_auto_correct = true
+        qe.debug_port = node[:serial] # консоль ВМ: nc localhost <порт> (для диагностики загрузки)
+      end
+
+      # ---------------- Provisioning ----------------
+      vm.vm.provision "common", type: "shell",
+        path: "scripts/common.sh",
+        args: [NET, HOSTS_ARG, node[:ip]]
+
+      if node[:role] == "mgmt"
+        vm.vm.provision "mgmt", type: "shell", path: "scripts/mgmt.sh"
+      end
+
+      if node[:role] == "runner"
+        vm.vm.provision "runner", type: "shell", path: "scripts/runner.sh"
+      end
+    end
+  end
+end
